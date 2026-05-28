@@ -366,18 +366,22 @@ pub fn build_ui(app: &gtk4::Application) {
 
     state.borrow_mut().window = Some(window.clone());
 
-    // ── Header bar with "+" button ──
-    let header = gtk4::HeaderBar::new();
+    // ── Botão de nova aba (barra nativa será mantida)
     let new_tab_btn = gtk4::Button::builder()
         .icon_name("list-add-symbolic")
         .tooltip_text("Nova aba (Ctrl+T)")
         .build();
-    header.pack_end(&new_tab_btn);
-    window.set_titlebar(Some(&header));
 
     // ── Layout ──
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     window.set_child(Some(&root));
+
+    // Top internal bar with the new-tab button (keep native titlebar)
+    // let top_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+    // top_bar.set_margin_top(6);
+    // top_bar.set_margin_start(6);
+    // top_bar.append(&new_tab_btn);
+    // root.append(&top_bar);
 
     let notebook = gtk4::Notebook::new();
     notebook.set_show_tabs(true);
