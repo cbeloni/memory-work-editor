@@ -1,6 +1,6 @@
 use std::{cell::RefCell, fs, path::PathBuf, rc::Rc, time::Duration};
 
-use gtk4::{gdk, gio, glib, prelude::*};
+use gtk4::{gdk, glib, prelude::*};
 
 use crate::cache::{self, CacheWriter};
 
@@ -13,6 +13,8 @@ struct TabEntry {
     hash: String,
     text_view: gtk4::TextView,
     tab_label: gtk4::Label,
+    /// Horizontal box that wraps the title label + close button (the Notebook tab widget).
+    tab_box: gtk4::Box,
     /// The ScrolledWindow that is the actual Notebook page child.
     page_widget: gtk4::ScrolledWindow,
     dirty: bool,
@@ -22,11 +24,19 @@ struct AppState {
     tabs: Vec<TabEntry>,
     writer: Option<CacheWriter>,
     next_id: usize,
+    window: Option<gtk4::ApplicationWindow>,
+    notebook: Option<gtk4::Notebook>,
 }
 
 impl AppState {
     fn new() -> Self {
-        Self { tabs: vec![], writer: Some(CacheWriter::spawn()), next_id: 0 }
+        Self {
+            tabs: vec![],
+            writer: Some(CacheWriter::spawn()),
+            next_id: 0,
+            window: None,
+            notebook: None,
+        }
     }
 
     fn flush_dirty(&mut self) {
@@ -116,6 +126,63 @@ fn restore_window_size(win: &gtk4::ApplicationWindow) {
 
 // ── Tab management ────────────────────────────────────────────────────────────
 
+/// Adjusts each tab's width so a single tab takes half the window,
+/// two tabs fill the full width, and three or more share equally.
+fn update_tab_sizes(state: &Rc<RefCell<AppState>>, win_w: i32) {
+    let s = state.borrow();
+    let count = s.tabs.len();
+    if count == 0 {
+        return;
+    }
+
+    let notebook = s.notebook.clone();
+
+    if count == 1 {
+        let target = win_w / 2;
+        for t in &s.tabs {
+            t.tab_box.set_width_request(target);
+            if let Some(nb) = &notebook {
+                nb.page(&t.page_widget).set_tab_expand(false);
+            }
+        }
+    } else {
+        // Enforce that two or more tabs occupy all available space.
+        // `tab-expand = true` enables sharing the space equally.
+        for t in &s.tabs {
+            // we set width_request = -1 to reset minimum requested width,
+            // so we don't interfere with natural distribution for 3+ tabs.
+            t.tab_box.set_width_request(-1);
+            if let Some(nb) = &notebook {
+                nb.page(&t.page_widget).set_tab_expand(true);
+            }
+        }
+    }
+}
+
+/// Convenience wrapper: pulls the window out of `AppState` and updates sizes.
+fn refresh_tab_sizes(state: &Rc<RefCell<AppState>>) {
+    let window = state.borrow().window.clone();
+    if let Some(w) = window {
+        let mut win_w = w.width();
+        if win_w <= 0 {
+            win_w = w.default_size().0;
+        }
+        if win_w <= 0 {
+            win_w = 1024;
+        }
+        update_tab_sizes(state, win_w);
+    }
+}
+
+/// Schedules `refresh_tab_sizes` to run on the next GTK idle tick. Useful right
+/// after `window.present()` so the window has time to allocate its real width.
+fn schedule_tab_size_refresh(state: &Rc<RefCell<AppState>>) {
+    let state_c = Rc::clone(state);
+    glib::idle_add_local_once(move || {
+        refresh_tab_sizes(&state_c);
+    });
+}
+
 fn add_tab(
     state: &Rc<RefCell<AppState>>,
     notebook: &gtk4::Notebook,
@@ -150,6 +217,9 @@ fn add_tab(
 
     // ── Tab label: [title label] [close button] ──
     let tab_label = gtk4::Label::new(Some(&title));
+    tab_label.set_hexpand(true);
+    tab_label.set_xalign(0.5);
+    tab_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
 
     let close_btn = gtk4::Button::builder()
         .icon_name("window-close-symbolic")
@@ -166,6 +236,7 @@ fn add_tab(
 
     let page_num = notebook.append_page(&scrolled, Some(&tab_box));
     notebook.set_tab_reorderable(&scrolled, true);
+    notebook.page(&scrolled).set_tab_expand(true);
     notebook.set_current_page(Some(page_num));
 
     // ── Register in state ──
@@ -177,10 +248,13 @@ fn add_tab(
             hash: hash.clone(),
             text_view: text_view.clone(),
             tab_label: tab_label.clone(),
+            tab_box: tab_box.clone(),
             page_widget: scrolled.clone(),
             dirty: false,
         });
     }
+
+    refresh_tab_sizes(state);
 
     // ── Text change signal: mark dirty + update labels ──
     {
@@ -251,6 +325,8 @@ fn close_tab_by_widget(
         if let Ok(path) = cache::create_tab_file() {
             add_tab(state, notebook, status, path, String::new());
         }
+    } else {
+        refresh_tab_sizes(state);
     }
 }
 
@@ -288,14 +364,27 @@ pub fn build_ui(app: &gtk4::Application) {
         .build();
     restore_window_size(&window);
 
+    state.borrow_mut().window = Some(window.clone());
+
+    // ── Header bar with "+" button ──
+    let header = gtk4::HeaderBar::new();
+    let new_tab_btn = gtk4::Button::builder()
+        .icon_name("list-add-symbolic")
+        .tooltip_text("Nova aba (Ctrl+T)")
+        .build();
+    header.pack_end(&new_tab_btn);
+    window.set_titlebar(Some(&header));
+
     // ── Layout ──
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     window.set_child(Some(&root));
 
     let notebook = gtk4::Notebook::new();
-    notebook.set_scrollable(true);
+    notebook.set_show_tabs(true);
     notebook.set_vexpand(true);
     root.append(&notebook);
+
+    state.borrow_mut().notebook = Some(notebook.clone());
 
     // Separator between notebook and status bar
     root.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
@@ -305,6 +394,18 @@ pub fn build_ui(app: &gtk4::Application) {
     status.set_margin_top(3);
     status.set_margin_bottom(3);
     root.append(&status);
+
+    // ── Connect new-tab button ──
+    {
+        let state_c = Rc::clone(&state);
+        let notebook_c = notebook.clone();
+        let status_c = status.clone();
+        new_tab_btn.connect_clicked(move |_| {
+            if let Ok(path) = cache::create_tab_file() {
+                add_tab(&state_c, &notebook_c, &status_c, path, String::new());
+            }
+        });
+    }
 
     // ── Restore session or open first tab ──
     match cache::scan_cache() {
@@ -324,7 +425,7 @@ pub fn build_ui(app: &gtk4::Application) {
     {
         let state_c = Rc::clone(&state);
         let status_c = status.clone();
-        notebook.connect_switch_page(move |nb, child, _pn| {
+        notebook.connect_switch_page(move |_nb, child, _pn| {
             let s = state_c.borrow();
             if let Some(t) = s.tabs.iter().find(|t| t.page_widget.upcast_ref::<gtk4::Widget>() == child) {
                 let content = buffer_text(&t.text_view);
@@ -332,6 +433,21 @@ pub fn build_ui(app: &gtk4::Application) {
                 // Focus the text view of the activated tab
                 t.text_view.grab_focus();
             }
+        });
+    }
+
+    // ── React to window resize: keep tab widths in sync ──
+    {
+        let state_c = Rc::clone(&state);
+        let win_c = window.clone();
+        let mut last_w = 0;
+        glib::timeout_add_local(Duration::from_millis(100), move || {
+            let curr_w = win_c.width();
+            if curr_w > 0 && curr_w != last_w {
+                last_w = curr_w;
+                update_tab_sizes(&state_c, curr_w);
+            }
+            glib::ControlFlow::Continue
         });
     }
 
@@ -398,4 +514,9 @@ pub fn build_ui(app: &gtk4::Application) {
     }
 
     window.present();
+
+    // Once the window has been allocated by the compositor, recompute tab widths
+    // using the real window size (initial calls during session restore happen
+    // before realization, when `width()` is still 0).
+    schedule_tab_size_refresh(&state);
 }
