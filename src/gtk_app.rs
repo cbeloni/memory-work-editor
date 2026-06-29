@@ -26,6 +26,8 @@ struct AppState {
     next_id: usize,
     window: Option<gtk4::ApplicationWindow>,
     notebook: Option<gtk4::Notebook>,
+    search_bar: Option<gtk4::SearchBar>,
+    search_entry: Option<gtk4::SearchEntry>,
 }
 
 impl AppState {
@@ -36,6 +38,8 @@ impl AppState {
             next_id: 0,
             window: None,
             notebook: None,
+            search_bar: None,
+            search_entry: None,
         }
     }
 
@@ -366,29 +370,39 @@ pub fn build_ui(app: &gtk4::Application) {
 
     state.borrow_mut().window = Some(window.clone());
 
-    // ── Botão de nova aba (barra nativa será mantida)
-    let new_tab_btn = gtk4::Button::builder()
-        .icon_name("list-add-symbolic")
-        .tooltip_text("Nova aba (Ctrl+T)")
-        .build();
-
     // ── Layout ──
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     window.set_child(Some(&root));
-
-    // Top internal bar with the new-tab button (keep native titlebar)
-    // let top_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
-    // top_bar.set_margin_top(6);
-    // top_bar.set_margin_start(6);
-    // top_bar.append(&new_tab_btn);
-    // root.append(&top_bar);
 
     let notebook = gtk4::Notebook::new();
     notebook.set_show_tabs(true);
     notebook.set_vexpand(true);
     root.append(&notebook);
 
+    // ── Botão de nova aba: pequeno, apenas ícone, no lado esquerdo das abas ──
+    let new_tab_btn = gtk4::Button::builder()
+        .icon_name("list-add-symbolic")
+        .tooltip_text("Nova aba (Ctrl+T)")
+        .has_frame(false)
+        .build();
+    new_tab_btn.add_css_class("flat");
+    notebook.set_action_widget(&new_tab_btn, gtk4::PackType::Start);
+
     state.borrow_mut().notebook = Some(notebook.clone());
+
+    // ── Search bar ──
+    let search_entry = gtk4::SearchEntry::new();
+    search_entry.set_placeholder_text(Some("Procurar..."));
+    search_entry.set_hexpand(true);
+
+    let search_bar = gtk4::SearchBar::new();
+    search_bar.set_child(Some(&search_entry));
+    search_bar.set_show_close_button(true);
+    search_bar.connect_entry(&search_entry);
+    root.append(&search_bar);
+
+    state.borrow_mut().search_bar = Some(search_bar.clone());
+    state.borrow_mut().search_entry = Some(search_entry.clone());
 
     // Separator between notebook and status bar
     root.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
@@ -408,6 +422,73 @@ pub fn build_ui(app: &gtk4::Application) {
             if let Ok(path) = cache::create_tab_file() {
                 add_tab(&state_c, &notebook_c, &status_c, path, String::new());
             }
+        });
+    }
+
+    // ── Search functionality ──
+    {
+        let state_c = Rc::clone(&state);
+        let notebook_c = notebook.clone();
+        search_entry.connect_search_changed(move |entry| {
+            let search_text = entry.text();
+            
+            let s = state_c.borrow();
+            if let Some(pn) = notebook_c.current_page() {
+                if let Some(child) = notebook_c.nth_page(Some(pn)) {
+                    if let Some(tab) = s.tabs.iter().find(|t| t.page_widget.upcast_ref::<gtk4::Widget>() == &child) {
+                        let buffer = tab.text_view.buffer();
+                        
+                        // Get or create search highlight tag
+                        let tag_table = buffer.tag_table();
+                        let tag = if let Some(existing_tag) = tag_table.lookup("search-match") {
+                            existing_tag
+                        } else {
+                            buffer.create_tag(
+                                Some("search-match"),
+                                &[("background", &"yellow"), ("foreground", &"black")],
+                            ).expect("Failed to create search-match tag")
+                        };
+
+                        // Remove previous search highlights
+                        buffer.remove_tag(&tag, &buffer.start_iter(), &buffer.end_iter());
+
+                        // If search text is empty, just clear highlights and return
+                        if search_text.is_empty() {
+                            return;
+                        }
+
+                        // Search and highlight all occurrences
+                        let mut start = buffer.start_iter();
+                        let search_str = search_text.as_str();
+                        
+                        while let Some((match_start, match_end)) = start.forward_search(
+                            search_str,
+                            gtk4::TextSearchFlags::CASE_INSENSITIVE,
+                            None,
+                        ) {
+                            buffer.apply_tag(&tag, &match_start, &match_end);
+                            start = match_end;
+                        }
+
+                        // Move cursor to first match
+                        let first_match = buffer.start_iter().forward_search(
+                            search_str,
+                            gtk4::TextSearchFlags::CASE_INSENSITIVE,
+                            None,
+                        );
+                        if let Some((match_start, _)) = first_match {
+                            buffer.place_cursor(&match_start);
+                            tab.text_view.scroll_to_iter(&mut match_start.clone(), 0.1, false, 0.0, 0.0);
+                        }
+                    }
+                }
+            }
+        });
+
+        // Close search bar with Escape
+        let search_bar_c = search_bar.clone();
+        search_entry.connect_stop_search(move |_| {
+            search_bar_c.set_search_mode(false);
         });
     }
 
@@ -485,6 +566,16 @@ pub fn build_ui(app: &gtk4::Application) {
                 }
                 gdk::Key::w => {
                     close_current_tab(&state_c, &notebook_c, &status_c);
+                    glib::Propagation::Stop
+                }
+                gdk::Key::f => {
+                    let s = state_c.borrow();
+                    if let Some(search_bar) = &s.search_bar {
+                        search_bar.set_search_mode(true);
+                        if let Some(search_entry) = &s.search_entry {
+                            search_entry.grab_focus();
+                        }
+                    }
                     glib::Propagation::Stop
                 }
                 _ => glib::Propagation::Proceed,
