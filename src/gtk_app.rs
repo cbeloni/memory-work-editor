@@ -356,6 +356,252 @@ fn close_current_tab(
     }
 }
 
+fn archive_current_tab(
+    state: &Rc<RefCell<AppState>>,
+    notebook: &gtk4::Notebook,
+    status: &gtk4::Label,
+) {
+    let Some(pn) = notebook.current_page() else { return };
+    let Some(child) = notebook.nth_page(Some(pn)) else { return };
+
+    let (page_widget, tab_id, file_path, content) = {
+        let s = state.borrow();
+        if let Some(tab) = s.tabs.iter().find(|t| t.page_widget.upcast_ref::<gtk4::Widget>() == &child) {
+            let content = buffer_text(&tab.text_view);
+            (Some(tab.page_widget.clone()), Some(tab.id), Some(tab.file_path.clone()), content)
+        } else {
+            (None, None, None, String::new())
+        }
+    };
+
+    if let (Some(pw), Some(id), Some(path)) = (page_widget, tab_id, file_path) {
+        // Archive the file on disk (creates archive-*.txt and removes active tab-*.txt)
+        if let Err(e) = cache::archive_tab(&path, &content) {
+            log::error!("Failed to archive tab {:?}: {}", path, e);
+            status.set_text("  Erro ao arquivar nota");
+            return;
+        }
+
+        // Remove page from notebook
+        if let Some(pn) = notebook.page_num(&pw) {
+            notebook.remove_page(Some(pn));
+        }
+
+        // Remove from state without deleting (archive_tab already handled removal of tab-*.txt)
+        let is_empty = {
+            let mut s = state.borrow_mut();
+            if let Some(idx) = s.tabs.iter().position(|t| t.id == id) {
+                s.tabs.remove(idx);
+            }
+            s.tabs.is_empty()
+        };
+
+        status.set_text("  Nota arquivada com sucesso");
+
+        if is_empty {
+            if let Ok(new_path) = cache::create_tab_file() {
+                add_tab(state, notebook, status, new_path, String::new());
+            }
+        } else {
+            refresh_tab_sizes(state);
+        }
+    }
+}
+
+fn open_archived_dialog(
+    parent_window: &gtk4::ApplicationWindow,
+    state: &Rc<RefCell<AppState>>,
+    notebook: &gtk4::Notebook,
+    status: &gtk4::Label,
+) {
+    let notes = match cache::scan_archives() {
+        Ok(n) => n,
+        Err(e) => {
+            log::error!("Failed to scan archives: {}", e);
+            vec![]
+        }
+    };
+
+    let dialog = gtk4::Window::builder()
+        .title("Notas Arquivadas")
+        .transient_for(parent_window)
+        .modal(true)
+        .default_width(600)
+        .default_height(460)
+        .build();
+
+    let root = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
+    root.set_margin_start(16);
+    root.set_margin_end(16);
+    root.set_margin_top(16);
+    root.set_margin_bottom(16);
+    dialog.set_child(Some(&root));
+
+    // Header title
+    let header_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    let title_lbl = gtk4::Label::new(Some("Notas Arquivadas"));
+    title_lbl.add_css_class("title-2");
+    title_lbl.set_xalign(0.0);
+    title_lbl.set_hexpand(true);
+    header_box.append(&title_lbl);
+    root.append(&header_box);
+
+    let scrolled = gtk4::ScrolledWindow::new();
+    scrolled.set_vexpand(true);
+    scrolled.set_hexpand(true);
+    scrolled.set_min_content_height(280);
+
+    let list_box = gtk4::ListBox::new();
+    list_box.set_selection_mode(gtk4::SelectionMode::None);
+    list_box.add_css_class("boxed-list");
+    scrolled.set_child(Some(&list_box));
+    root.append(&scrolled);
+
+    let empty_label = gtk4::Label::new(Some("Nenhuma nota arquivada encontrada."));
+    empty_label.set_margin_top(40);
+    empty_label.set_margin_bottom(40);
+    empty_label.add_css_class("dim-label");
+
+    if notes.is_empty() {
+        list_box.append(&empty_label);
+    }
+
+    // Bottom action bar
+    let action_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    action_bar.set_halign(gtk4::Align::End);
+
+    let close_btn = gtk4::Button::builder().label("Fechar").build();
+    action_bar.append(&close_btn);
+    root.append(&action_bar);
+
+    let dialog_c = dialog.clone();
+    close_btn.connect_clicked(move |_| {
+        dialog_c.close();
+    });
+
+    for note in &notes {
+        let row = gtk4::ListBoxRow::new();
+        let item_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+        item_box.set_margin_start(12);
+        item_box.set_margin_end(12);
+        item_box.set_margin_top(8);
+        item_box.set_margin_bottom(8);
+
+        // Text details (vertical)
+        let text_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+        text_box.set_hexpand(true);
+
+        // Top line: title + date
+        let top_line = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        let note_title = gtk4::Label::new(Some(&note.title));
+        note_title.add_css_class("heading");
+        note_title.set_xalign(0.0);
+        note_title.set_hexpand(true);
+        note_title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+
+        let date_lbl = gtk4::Label::new(Some(&note.timestamp_display));
+        date_lbl.add_css_class("dim-label");
+        date_lbl.add_css_class("caption");
+        date_lbl.set_xalign(1.0);
+
+        top_line.append(&note_title);
+        top_line.append(&date_lbl);
+        text_box.append(&top_line);
+
+        // Preview snippet
+        let snippet = if note.preview.trim().is_empty() {
+            "(Nota vazia)".to_string()
+        } else {
+            note.preview.lines().take(2).collect::<Vec<_>>().join(" · ")
+        };
+        let preview_lbl = gtk4::Label::new(Some(&snippet));
+        preview_lbl.set_xalign(0.0);
+        preview_lbl.add_css_class("dim-label");
+        preview_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        text_box.append(&preview_lbl);
+
+        // Details: chars / lines
+        let stats_lbl = gtk4::Label::new(Some(&format!("{} caracteres  │  {} linhas", note.char_count, note.line_count)));
+        stats_lbl.set_xalign(0.0);
+        stats_lbl.add_css_class("caption");
+        stats_lbl.add_css_class("dim-label");
+        text_box.append(&stats_lbl);
+
+        item_box.append(&text_box);
+
+        // Action buttons: Restore & Delete
+        let btn_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        btn_box.set_valign(gtk4::Align::Center);
+
+        let restore_btn = gtk4::Button::builder()
+            .label("Restaurar")
+            .tooltip_text("Restaurar e abrir como nota ativa")
+            .build();
+        restore_btn.add_css_class("suggested-action");
+
+        let delete_btn = gtk4::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .tooltip_text("Excluir nota arquivada definitivamente")
+            .has_frame(false)
+            .build();
+        delete_btn.add_css_class("flat");
+
+        btn_box.append(&restore_btn);
+        btn_box.append(&delete_btn);
+        item_box.append(&btn_box);
+
+        row.set_child(Some(&item_box));
+        list_box.append(&row);
+
+        // Restore click handler
+        {
+            let note_path = note.path.clone();
+            let state_c = Rc::clone(state);
+            let notebook_c = notebook.clone();
+            let status_c = status.clone();
+            let dialog_c = dialog.clone();
+
+            restore_btn.connect_clicked(move |_| {
+                match cache::unarchive_tab(&note_path) {
+                    Ok((tab_path, content)) => {
+                        add_tab(&state_c, &notebook_c, &status_c, tab_path, content);
+                        status_c.set_text("  Nota restaurada do arquivo com sucesso");
+                        dialog_c.close();
+                    }
+                    Err(e) => {
+                        log::error!("Failed to unarchive note {:?}: {}", note_path, e);
+                        status_c.set_text("  Erro ao restaurar nota arquivada");
+                    }
+                }
+            });
+        }
+
+        // Delete click handler
+        {
+            let note_path = note.path.clone();
+            let list_box_c = list_box.clone();
+            let row_c = row.clone();
+            let status_c = status.clone();
+            let empty_label_c = empty_label.clone();
+
+            delete_btn.connect_clicked(move |_| {
+                if let Err(e) = cache::delete_archive_file(&note_path) {
+                    log::error!("Failed to delete archive {:?}: {}", note_path, e);
+                    status_c.set_text("  Erro ao excluir arquivo");
+                } else {
+                    list_box_c.remove(&row_c);
+                    status_c.set_text("  Nota arquivada excluída");
+                    if list_box_c.first_child().is_none() {
+                        list_box_c.append(&empty_label_c);
+                    }
+                }
+            });
+        }
+    }
+
+    dialog.present();
+}
+
 // ── App builder ───────────────────────────────────────────────────────────────
 
 pub fn build_ui(app: &gtk4::Application) {
@@ -379,14 +625,36 @@ pub fn build_ui(app: &gtk4::Application) {
     notebook.set_vexpand(true);
     root.append(&notebook);
 
-    // ── Botão de nova aba: pequeno, apenas ícone, no lado esquerdo das abas ──
+    // ── Botões de ação nas abas: Nova aba, Arquivar e Abrir arquivados ──
+    let actions_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 2);
+    actions_box.set_margin_start(4);
+    actions_box.set_margin_end(4);
+
     let new_tab_btn = gtk4::Button::builder()
         .icon_name("list-add-symbolic")
         .tooltip_text("Nova aba (Ctrl+T)")
         .has_frame(false)
         .build();
     new_tab_btn.add_css_class("flat");
-    notebook.set_action_widget(&new_tab_btn, gtk4::PackType::Start);
+    actions_box.append(&new_tab_btn);
+
+    let archive_tab_btn = gtk4::Button::builder()
+        .icon_name("folder-download-symbolic")
+        .tooltip_text("Arquivar nota atual (Ctrl+Alt+A)")
+        .has_frame(false)
+        .build();
+    archive_tab_btn.add_css_class("flat");
+    actions_box.append(&archive_tab_btn);
+
+    let open_archived_btn = gtk4::Button::builder()
+        .icon_name("document-open-symbolic")
+        .tooltip_text("Abrir notas arquivadas (Ctrl+O)")
+        .has_frame(false)
+        .build();
+    open_archived_btn.add_css_class("flat");
+    actions_box.append(&open_archived_btn);
+
+    notebook.set_action_widget(&actions_box, gtk4::PackType::Start);
 
     state.borrow_mut().notebook = Some(notebook.clone());
 
@@ -413,7 +681,7 @@ pub fn build_ui(app: &gtk4::Application) {
     status.set_margin_bottom(3);
     root.append(&status);
 
-    // ── Connect new-tab button ──
+    // ── Connect actions buttons ──
     {
         let state_c = Rc::clone(&state);
         let notebook_c = notebook.clone();
@@ -422,6 +690,23 @@ pub fn build_ui(app: &gtk4::Application) {
             if let Ok(path) = cache::create_tab_file() {
                 add_tab(&state_c, &notebook_c, &status_c, path, String::new());
             }
+        });
+    }
+    {
+        let state_c = Rc::clone(&state);
+        let notebook_c = notebook.clone();
+        let status_c = status.clone();
+        archive_tab_btn.connect_clicked(move |_| {
+            archive_current_tab(&state_c, &notebook_c, &status_c);
+        });
+    }
+    {
+        let state_c = Rc::clone(&state);
+        let notebook_c = notebook.clone();
+        let status_c = status.clone();
+        let win_c = window.clone();
+        open_archived_btn.connect_clicked(move |_| {
+            open_archived_dialog(&win_c, &state_c, &notebook_c, &status_c);
         });
     }
 
@@ -550,6 +835,7 @@ pub fn build_ui(app: &gtk4::Application) {
         let state_c = Rc::clone(&state);
         let notebook_c = notebook.clone();
         let status_c = status.clone();
+        let win_c = window.clone();
 
         let ctrl = gtk4::EventControllerKey::new();
         ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
@@ -557,6 +843,15 @@ pub fn build_ui(app: &gtk4::Application) {
             if !modifiers.contains(gdk::ModifierType::CONTROL_MASK) {
                 return glib::Propagation::Proceed;
             }
+
+            // Ctrl+Alt+A or Ctrl+Shift+A -> Arquivar nota atual
+            let is_alt = modifiers.contains(gdk::ModifierType::ALT_MASK);
+            let is_shift = modifiers.contains(gdk::ModifierType::SHIFT_MASK);
+            if (is_alt || is_shift) && (key == gdk::Key::a || key == gdk::Key::A) {
+                archive_current_tab(&state_c, &notebook_c, &status_c);
+                return glib::Propagation::Stop;
+            }
+
             match key {
                 gdk::Key::t => {
                     if let Ok(path) = cache::create_tab_file() {
@@ -576,6 +871,10 @@ pub fn build_ui(app: &gtk4::Application) {
                             search_entry.grab_focus();
                         }
                     }
+                    glib::Propagation::Stop
+                }
+                gdk::Key::o => {
+                    open_archived_dialog(&win_c, &state_c, &notebook_c, &status_c);
                     glib::Propagation::Stop
                 }
                 _ => glib::Propagation::Proceed,
